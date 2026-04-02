@@ -10,13 +10,13 @@ on:
   workflow_dispatch:
     inputs:
       max_workers:
-        description: "Number of parallel threads (default: 20)"
+        description: "Number of parallel threads (default: 10)"
         required: false
-        default: "20"
+        default: "10"
       batch_size:
-        description: "Jobs per batch (default: 500)"
+        description: "Jobs per batch (default: 200)"
         required: false
-        default: "500"
+        default: "200"
       output_csv:
         description: "Output CSV filename"
         required: false
@@ -69,14 +69,14 @@ jobs:
           JENKINS_TOKEN:  ${{ secrets.JENKINS_TOKEN }}
           # Set VERIFY_SSL=false as a secret if Jenkins uses a self-signed cert
           VERIFY_SSL:     ${{ secrets.VERIFY_SSL || 'true' }}
-          MAX_WORKERS:    ${{ github.event.inputs.max_workers || '20' }}
-          BATCH_SIZE:     ${{ github.event.inputs.batch_size || '500' }}
+          MAX_WORKERS:    ${{ github.event.inputs.max_workers || '10' }}
+          BATCH_SIZE:     ${{ github.event.inputs.batch_size || '200' }}
           OUTPUT_CSV:     ${{ github.event.inputs.output_csv || 'jenkins_pipeline_inventory.csv' }}
-          CONNECT_TIMEOUT:  "10"
-          READ_TIMEOUT:     "60"
+          CONNECT_TIMEOUT:  "15"
+          READ_TIMEOUT:     "90"
           RETRY_COUNT:      "3"
           BACKOFF_FACTOR:   "2.0"
-          RATE_LIMIT_DELAY: "0.05"
+          RATE_LIMIT_DELAY: "0.1"
         run: python jenkins_inventory.py
 
       # ── 5. Upload CSV as artifact ─────────────────────────────────────────
