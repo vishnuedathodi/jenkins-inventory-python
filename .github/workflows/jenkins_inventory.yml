@@ -1,6 +1,11 @@
 name: Jenkins Pipeline Inventory
 
 on:
+  # Trigger automatically on every push to the inventory feature branch
+  push:
+    branches:
+      - feature/jenkins-inventory
+
   # Run on-demand from the GitHub Actions UI
   workflow_dispatch:
     inputs:
@@ -24,7 +29,9 @@ on:
 jobs:
   inventory:
     name: Collect Jenkins Pipeline Inventory
-    runs-on: ubuntu-latest
+    # Self-hosted runner group: cvs-linux-self-hosted
+    # This runner must have network access to Jenkins.
+    runs-on: [self-hosted, cvs-linux-self-hosted]
     timeout-minutes: 360          # 6 h max for 100 k pipelines
 
     steps:
@@ -43,18 +50,32 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # ── 3b. (Optional) Connect to corporate VPN via Tailscale ────────────
+      # Uncomment this block if Jenkins is behind a private network and you
+      # are using a GitHub-hosted runner (ubuntu-latest).
+      # Requires TAILSCALE_AUTHKEY secret to be set.
+      #
+      # - name: Connect to Tailscale VPN
+      #   uses: tailscale/github-action@v2
+      #   with:
+      #     authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      #     args: --accept-routes
+
       # ── 4. Run inventory script ───────────────────────────────────────────
       - name: Run Jenkins inventory
         env:
           JENKINS_URL:    ${{ secrets.JENKINS_URL }}
           JENKINS_USER:   ${{ secrets.JENKINS_USER }}
           JENKINS_TOKEN:  ${{ secrets.JENKINS_TOKEN }}
+          # Set VERIFY_SSL=false as a secret if Jenkins uses a self-signed cert
+          VERIFY_SSL:     ${{ secrets.VERIFY_SSL || 'true' }}
           MAX_WORKERS:    ${{ github.event.inputs.max_workers || '20' }}
           BATCH_SIZE:     ${{ github.event.inputs.batch_size || '500' }}
           OUTPUT_CSV:     ${{ github.event.inputs.output_csv || 'jenkins_pipeline_inventory.csv' }}
-          REQUEST_TIMEOUT: "30"
-          RETRY_COUNT:     "3"
-          BACKOFF_FACTOR:  "2.0"
+          CONNECT_TIMEOUT:  "10"
+          READ_TIMEOUT:     "60"
+          RETRY_COUNT:      "3"
+          BACKOFF_FACTOR:   "2.0"
           RATE_LIMIT_DELAY: "0.05"
         run: python jenkins_inventory.py
 
