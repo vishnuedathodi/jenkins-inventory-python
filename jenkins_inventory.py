@@ -607,51 +607,68 @@ def write_csv(records: list[PipelineRecord], path: str) -> None:
 def _check_connectivity(session: requests.Session) -> None:
     """
     Probe the Jenkins root API to verify connectivity before crawling.
-    Uses get_timeout() directly — bypasses urllib3 Retry so the read
-    timeout is always the correct READ_TIMEOUT value.
+
+    Probe strategy
+    ──────────────
+    We use /login (a plain HTTP GET that returns HTML) rather than the JSON API
+    because the API endpoint can trigger Jenkins to compute cluster state, which
+    is slow on large instances (and causes ReadTimeout on the probe even though
+    the crawl itself works fine).
+
+    Abort conditions (hard failures):
+      • ConnectTimeout  → runner cannot reach Jenkins at all
+      • SSLError        → cert problem
+      • HTTP 401 / 403  → bad credentials / missing permission
+
+    Continue conditions (soft — log a warning, proceed with crawl):
+      • ReadTimeout     → Jenkins is reachable (TCP connect succeeded) but slow
+                          to respond on the probe endpoint.  The crawl will use
+                          per-request retries so a slow root API is not fatal.
+      • ConnectionError → transient; warn and proceed
     """
-    root_url = re.sub(r"(/job/[^/]+)+/?$", "", JENKINS_URL).rstrip("/")
-    if root_url != JENKINS_URL:
-        logger.warning(
-            "JENKINS_URL contains a job path — stripped to root: %s", root_url
-        )
+    root_url = JENKINS_URL.rstrip("/")
 
-    probe_url = f"{root_url}/api/json?tree=nodeName"
+    # /login is a tiny unauthenticated HTML page — much faster than /api/json
+    # which makes Jenkins evaluate the full object model.
+    probe_url = f"{root_url}/login"
+    # Short probe timeout: connect must succeed quickly; read can be brief too.
+    probe_timeout = (CONNECT_TIMEOUT, min(READ_TIMEOUT, 30))
     logger.info("Connectivity check → %s  (connect=%ds  read=%ds)",
-                probe_url, CONNECT_TIMEOUT, READ_TIMEOUT)
+                probe_url, probe_timeout[0], probe_timeout[1])
 
-    # Use a plain session.get with NO Retry adapter for the probe,
-    # so we get a clean error immediately without urllib3 retrying on its own.
+    # Bare session — no Retry adapter so any error surfaces immediately.
     probe_session = requests.Session()
     probe_session.auth = session.auth
     probe_session.verify = session.verify
     probe_session.headers.update(session.headers)
 
     try:
-        resp = probe_session.get(probe_url, timeout=get_timeout())
+        resp = probe_session.get(probe_url, timeout=probe_timeout, allow_redirects=True)
         if resp.status_code == 401:
             logger.error("HTTP 401 — check JENKINS_USER and JENKINS_TOKEN.")
             raise SystemExit(1)
         if resp.status_code == 403:
             logger.error("HTTP 403 — service account lacks Overall/Read permission.")
             raise SystemExit(1)
-        if resp.status_code not in (200, 404):
-            logger.error("Unexpected HTTP %s from Jenkins probe.", resp.status_code)
-            raise SystemExit(1)
+        # 200, 302, 404 are all fine — the server is up
         logger.info("Jenkins is reachable ✓  (HTTP %s)", resp.status_code)
 
     except requests.exceptions.ReadTimeout:
-        logger.error(
+        # TCP connect succeeded → Jenkins is up, just slow on this endpoint.
+        # Warn but do NOT abort; the crawl uses _request_with_retry with
+        # proper READ_TIMEOUT and can tolerate slow responses.
+        logger.warning(
             "\n"
             "═══════════════════════════════════════════════════════════\n"
-            " READ TIMEOUT on connectivity probe (read=%ds).\n"
-            " Jenkins is reachable but not responding in time.\n"
-            " → Increase READ_TIMEOUT env var (e.g. READ_TIMEOUT=180)\n"
-            " → Or Jenkins is under heavy load — try again later.\n"
+            " Connectivity probe read-timed-out (read=%ds) — but TCP\n"
+            " connect succeeded, so Jenkins IS reachable.\n"
+            " Proceeding with crawl (per-job timeout = %ds read).\n"
+            " If crawl also fails, set READ_TIMEOUT=180 and retry.\n"
             "═══════════════════════════════════════════════════════════",
-            READ_TIMEOUT,
+            probe_timeout[1], READ_TIMEOUT,
         )
-        raise SystemExit(1)
+        # Not a SystemExit — we continue
+
     except requests.exceptions.ConnectTimeout:
         logger.error(
             "\n"
@@ -667,8 +684,8 @@ def _check_connectivity(session: requests.Session) -> None:
         logger.error("SSL error: %s  →  Set VERIFY_SSL=false if self-signed.", exc)
         raise SystemExit(1)
     except requests.exceptions.ConnectionError as exc:
-        logger.error("Connection error during probe: %s", exc)
-        raise SystemExit(1)
+        # e.g. DNS failure, connection refused — warn and let BFS surface errors
+        logger.warning("Connection error during probe: %s — proceeding anyway.", exc)
     finally:
         probe_session.close()
 
