@@ -131,25 +131,28 @@ def _request_with_retry(session: requests.Session, url: str) -> Optional[request
     • stream=True + response.content forces urllib3 to read the full body
       inside our timeout window, not just wait for the first byte.
     • Semaphore gates max simultaneous in-flight requests to protect Jenkins.
-    • Back-off sleep runs OUTSIDE the semaphore so other threads can proceed.
+    • Rate-limit sleep runs BEFORE acquiring the semaphore so we don't hold
+      a slot while sleeping (which would starve other threads).
+    • Back-off sleep runs OUTSIDE the semaphore for the same reason.
     """
     last_exc: Optional[Exception] = None
     total_attempts = RETRY_COUNT + 1
 
     for attempt in range(1, total_attempts + 1):
-        # Read globals fresh every attempt — these are the values that will
-        # actually reach urllib3.  Log them so any mismatch is obvious.
+        # Read globals fresh every attempt — logged on warning so any
+        # mismatch between env var and actual value is immediately visible.
         ct = CONNECT_TIMEOUT
         rt = READ_TIMEOUT
 
+        # Sleep BEFORE acquiring semaphore so we don't hold the slot idle
+        time.sleep(RATE_LIMIT_DELAY)
+
         with _SEMAPHORE:
-            time.sleep(RATE_LIMIT_DELAY)
             try:
                 resp = session.get(url, timeout=(ct, rt), stream=True)
                 # Force full body download inside the timeout window.
-                # Without this, timeout only covers the first byte ("time to
-                # first byte"), and large JSON responses (root /api/json with
-                # 100k jobs) stall after the headers arrive.
+                # Without this, the read timeout only covers time-to-first-byte;
+                # large responses (root /api/json, console logs) stall afterwards.
                 _ = resp.content
                 return resp
             except requests.exceptions.ReadTimeout as exc:
@@ -240,61 +243,63 @@ def _derive_folder_path(job_url: str) -> str:
 
 # Each queue entry is a tuple: (url, folder_label)
 # folder_label tracks the human-readable path of the *parent* container.
-def _fetch_jobs_at(session: requests.Session, base: str) -> list[dict]:
+def _fetch_jobs_at(base: str) -> list[dict]:
     """
     Fetch the immediate children of a Jenkins folder/view URL.
-    Tries ?tree=jobs[...] first; falls back to ?depth=1 if that returns
-    an empty jobs list (some Jenkins configs need depth=1 at the root).
-    Returns a list of raw job dicts (may be empty on failure).
+    Creates its own session (thread-safe — no shared connection pool).
+    Tries ?tree=jobs[...] first; falls back to ?depth=1 at the root.
+    Returns a list of raw job dicts (empty on any failure).
     """
-    # Primary: structured tree query
-    api_url = f"{base}/api/json?tree=jobs[name,url,_class]"
-    resp = _request_with_retry(session, api_url)
-    if resp is None:
-        logger.error(
-            "BFS: _request_with_retry returned None for %s — "
-            "all retry attempts failed (timeout or connection error).", api_url
-        )
-        return []
-
-    if resp.status_code != 200:
-        logger.error(
-            "BFS: HTTP %s for %s — check credentials/permissions.", resp.status_code, api_url
-        )
-        return []
-
+    session = make_session()   # thread-local — avoids urllib3 pool contention
     try:
-        data = resp.json()
-    except Exception as exc:
-        logger.error("BFS: JSON decode error for %s: %s", api_url, exc)
-        return []
-
-    jobs = data.get("jobs", [])
-
-    # Fallback: if jobs list is empty at root level, maybe the instance
-    # requires depth=1 (e.g. CloudBees Jenkins Operations Center / parent pom).
-    if not jobs and base == JENKINS_URL:
-        logger.warning(
-            "BFS: root returned 0 jobs with tree= query — retrying with depth=1 …"
-        )
-        fallback_url = f"{base}/api/json?depth=1"
-        resp2 = _request_with_retry(session, fallback_url)
-        if resp2 and resp2.status_code == 200:
-            try:
-                data2 = resp2.json()
-                jobs = data2.get("jobs", [])
-                logger.info("BFS: depth=1 fallback returned %d jobs.", len(jobs))
-                # depth=1 jobs may not include _class — that's OK, we handle missing below
-            except Exception as exc:
-                logger.warning("BFS: depth=1 JSON decode error: %s", exc)
-        else:
-            logger.warning(
-                "BFS: depth=1 fallback also failed (status=%s).",
-                resp2.status_code if resp2 else "no response",
+        # Primary: structured tree query
+        api_url = f"{base}/api/json?tree=jobs[name,url,_class]"
+        resp = _request_with_retry(session, api_url)
+        if resp is None:
+            logger.error(
+                "BFS: all retries failed for %s (timeout or connection error).", api_url
             )
+            return []
 
-    logger.debug("BFS: %s → %d immediate children", base, len(jobs))
-    return jobs
+        if resp.status_code != 200:
+            logger.error(
+                "BFS: HTTP %s for %s — check credentials/permissions.", resp.status_code, api_url
+            )
+            return []
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            logger.error("BFS: JSON decode error for %s: %s", api_url, exc)
+            return []
+
+        jobs = data.get("jobs", [])
+
+        # Fallback: root returned 0 jobs — try depth=1 (CloudBees / JCOC)
+        if not jobs and base == JENKINS_URL:
+            logger.warning("BFS: root returned 0 jobs — retrying with depth=1 …")
+            fallback_url = f"{base}/api/json?depth=1"
+            resp2 = _request_with_retry(session, fallback_url)
+            if resp2 and resp2.status_code == 200:
+                try:
+                    data2 = resp2.json()
+                    jobs = data2.get("jobs", [])
+                    logger.info("BFS: depth=1 fallback returned %d jobs.", len(jobs))
+                except Exception as exc:
+                    logger.warning("BFS: depth=1 JSON decode error: %s", exc)
+            else:
+                logger.warning(
+                    "BFS: depth=1 fallback failed (status=%s).",
+                    resp2.status_code if resp2 else "no response",
+                )
+
+        return jobs
+
+    except Exception as exc:
+        logger.error("BFS: unexpected error fetching %s: %s", base, exc)
+        return []
+    finally:
+        session.close()
 
 
 def collect_all_jobs(session: requests.Session) -> list[tuple[str, str]]:
@@ -302,66 +307,105 @@ def collect_all_jobs(session: requests.Session) -> list[tuple[str, str]]:
     Recursively walk the Jenkins job tree and return a flat list of
     (job_url, folder_path) tuples for every pipeline/freestyle/multibranch job.
 
-    NOTE: We do NOT use tree= depth limiting because it silently drops nested
-    folders beyond the requested depth (which caused the "only 4 entries" bug).
-    Instead we fetch one level at a time and BFS-recurse explicitly.
+    Uses a parallel BFS: up to MAX_WORKERS folders are fetched concurrently
+    per wave, so the discovery phase scales with thread count instead of
+    waiting for each folder serially.
     """
     logger.info("Collecting all jobs from Jenkins (root: %s) …", JENKINS_URL)
     all_jobs: list[tuple[str, str]] = []
+    visited: set[str] = set()
+    # Lock protects all_jobs, visited, and the queue across threads
+    lock = threading.Lock()
+
     # Queue items: (base_url, folder_label_so_far)
     queue: list[tuple[str, str]] = [(JENKINS_URL, "")]
-    visited: set[str] = set()
+
+    # BFS wave-by-wave: process up to MAX_WORKERS nodes per wave in parallel
+    bfs_workers = max(1, min(MAX_WORKERS, 20))
 
     while queue:
-        base, parent_folder = queue.pop(0)
-        if base in visited:
-            continue
-        visited.add(base)
+        # Snapshot a wave of nodes to process in parallel
+        with lock:
+            wave = []
+            while queue and len(wave) < bfs_workers:
+                item = queue.pop(0)
+                base, _ = item
+                if base not in visited:
+                    visited.add(base)
+                    wave.append(item)
 
-        jobs = _fetch_jobs_at(session, base)
-        if not jobs:
-            if base == JENKINS_URL:
-                logger.error(
-                    "BFS: No jobs returned at root level (%s).\n"
-                    "  → Verify JENKINS_URL is the Jenkins root (no /job/... suffix).\n"
-                    "  → Confirm the service account has Overall/Read + Job/Read.\n"
-                    "  → Check the log above for HTTP status or timeout details.",
-                    JENKINS_URL,
-                )
-            continue
+        if not wave:
+            break
 
-        for job in jobs:
-            job_url   = job.get("url", "").rstrip("/")
-            job_name  = job.get("name", "")
-            job_class = job.get("_class", "")
+        # Fetch all nodes in this wave concurrently — each call gets its own session
+        with ThreadPoolExecutor(max_workers=len(wave),
+                                thread_name_prefix="bfs-worker") as ex:
+            future_map = {
+                ex.submit(_fetch_jobs_at, base): (base, parent_folder)
+                for base, parent_folder in wave
+            }
+            for future in as_completed(future_map):
+                base, parent_folder = future_map[future]
+                try:
+                    jobs = future.result()
+                except Exception as exc:
+                    logger.warning("BFS fetch error for %s: %s", base, exc)
+                    jobs = []
 
-            if not job_url:
-                continue
+                if not jobs:
+                    if base == JENKINS_URL:
+                        logger.error(
+                            "BFS: No jobs returned at root level (%s).\n"
+                            "  → Verify JENKINS_URL is the Jenkins root (no /job/... suffix).\n"
+                            "  → Confirm the service account has Overall/Read + Job/Read.\n"
+                            "  → Check the log above for HTTP status or timeout details.",
+                            JENKINS_URL,
+                        )
+                    continue
 
-            # Build the folder label for items *inside* this node
-            current_label = f"{parent_folder} » {job_name}".lstrip(" » ")
+                new_queue_items: list[tuple[str, str]] = []
+                new_jobs: list[tuple[str, str]] = []
 
-            if any(k in job_class for k in ("Folder", "OrganizationFolder")):
-                # Pure container — recurse, no job record emitted
-                queue.append((job_url, current_label))
+                for job in jobs:
+                    job_url   = job.get("url", "").rstrip("/")
+                    job_name  = job.get("name", "")
+                    job_class = job.get("_class", "")
 
-            elif "WorkflowMultiBranchProject" in job_class:
-                # Multibranch parent: record it AND recurse into branch children
-                folder = parent_folder if parent_folder else "(root)"
-                all_jobs.append((job_url, folder))
-                queue.append((job_url, current_label))
+                    if not job_url:
+                        continue
 
-            else:
-                # Leaf job (Pipeline, Freestyle, Matrix, etc.)
-                folder = parent_folder if parent_folder else "(root)"
-                all_jobs.append((job_url, folder))
+                    current_label = f"{parent_folder} » {job_name}".lstrip(" » ")
 
-        # Log progress every 100 BFS nodes visited so large instances show signs of life
-        if len(visited) % 100 == 0:
-            logger.info("BFS progress: %d nodes visited, %d jobs found, %d in queue",
-                        len(visited), len(all_jobs), len(queue))
+                    if any(k in job_class for k in ("Folder", "OrganizationFolder")):
+                        new_queue_items.append((job_url, current_label))
 
-    logger.info("Total jobs found: %d", len(all_jobs))
+                    elif "WorkflowMultiBranchProject" in job_class:
+                        folder = parent_folder if parent_folder else "(root)"
+                        new_jobs.append((job_url, folder))
+                        new_queue_items.append((job_url, current_label))
+
+                    else:
+                        folder = parent_folder if parent_folder else "(root)"
+                        new_jobs.append((job_url, folder))
+
+                with lock:
+                    all_jobs.extend(new_jobs)
+                    for item in new_queue_items:
+                        if item[0] not in visited:
+                            queue.append(item)
+
+        with lock:
+            total_visited = len(visited)
+            total_found   = len(all_jobs)
+            total_queued  = len(queue)
+
+        if total_visited % 100 == 0 or total_visited <= 10:
+            logger.info(
+                "BFS progress: %d nodes visited | %d jobs found | %d folders in queue",
+                total_visited, total_found, total_queued,
+            )
+
+    logger.info("BFS complete: %d nodes visited | %d total jobs found", len(visited), len(all_jobs))
     return all_jobs
 
 
@@ -579,10 +623,14 @@ def parse_console_output(console_text: str, rec: PipelineRecord) -> PipelineReco
 # Last-run date
 # ---------------------------------------------------------------------------
 def get_last_run_date(session: requests.Session, job_url: str) -> str:
-    data = get_json(session, f"{job_url}/lastBuild/api/json?tree=timestamp")
-    if data and "timestamp" in data:
-        ts = data["timestamp"] / 1000
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
+    """Return the last build timestamp as a UTC string, or empty string."""
+    try:
+        data = get_json(session, f"{job_url}/lastBuild/api/json?tree=timestamp")
+        if data and data.get("timestamp"):
+            ts = int(data["timestamp"]) / 1000
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
+    except Exception as exc:
+        logger.debug("Could not get last run date for %s: %s", job_url, exc)
     return ""
 
 
@@ -596,42 +644,41 @@ def process_job(job_url: str, folder_path: str) -> PipelineRecord:
     2. Fetch console output    → ALWAYS; authoritative for tech_stack & shared_libraries,
                                  fallback for repo/branch if config.xml was empty
     3. Fetch last-run date
+    Session is always closed in the finally block to prevent socket leaks.
+    Any unhandled exception is caught and stored in rec.error — never raises.
     """
-    session = make_session()   # thread-local session
+    session = make_session()
     rec = PipelineRecord(pipeline_url=job_url)
 
-    # Derive display name from URL (last /job/<name> segment)
-    rec.pipeline_name = job_url.rstrip("/").split("/job/")[-1]
-    rec.folder_path   = folder_path
-
-    # ── Step 1: config.xml ──────────────────────────────────────────────────
-    config_text = get_text(session, f"{job_url}/config.xml")
-    if config_text:
-        rec = parse_config_xml(config_text, job_url)
+    try:
+        # Derive display name from URL (last /job/<name> segment)
         rec.pipeline_name = job_url.rstrip("/").split("/job/")[-1]
-        rec.pipeline_url  = job_url
         rec.folder_path   = folder_path
-    else:
-        rec.error  = "config.xml unavailable"
-        rec.source = "none"
 
-    # ── Step 2: Console output — ALWAYS fetched ─────────────────────────────
-    # tech_stack and shared_libraries come from here (more reliable than XML).
-    # Also fills in repo/branch when config.xml didn't have them.
-    console_text = get_text(session, f"{job_url}/lastBuild/consoleText")
-    if console_text:
-        rec = parse_console_output(console_text, rec)
-    else:
-        logger.debug("No console output for %s (may never have run)", job_url)
-        # If no console, try to get tech stack from config.xml inline script
-        if not rec.tech_stack or rec.tech_stack == "Unknown":
-            if config_text:
+        # ── Step 1: config.xml ──────────────────────────────────────────────
+        config_text = get_text(session, f"{job_url}/config.xml")
+        if config_text:
+            rec = parse_config_xml(config_text, job_url)
+            rec.pipeline_name = job_url.rstrip("/").split("/job/")[-1]
+            rec.pipeline_url  = job_url
+            rec.folder_path   = folder_path
+        else:
+            rec.error  = "config.xml unavailable"
+            rec.source = "none"
+
+        # ── Step 2: Console output — ALWAYS fetched ─────────────────────────
+        console_text = get_text(session, f"{job_url}/lastBuild/consoleText")
+        if console_text:
+            rec = parse_console_output(console_text, rec)
+        else:
+            logger.debug("No console output for %s (may never have run)", job_url)
+            # Fallback: detect tech stack from inline Jenkinsfile script in XML
+            if (not rec.tech_stack or rec.tech_stack == "Unknown") and config_text:
                 try:
-                    root = ET.fromstring(config_text)
-                    inline = _xml_text(root, ".//definition/script", ".//script")
+                    xml_root = ET.fromstring(config_text)
+                    inline = _xml_text(xml_root, ".//definition/script", ".//script")
                     if inline:
                         rec.tech_stack = detect_tech_stack_from_text(inline)
-                        # Also pick up @Library from inline script
                         inline_libs = re.findall(r"@Library\(['\"]([^'\"]+)['\"]\)", inline)
                         if inline_libs:
                             existing = [l for l in rec.shared_libraries.split("; ") if l]
@@ -639,8 +686,16 @@ def process_job(job_url: str, folder_path: str) -> PipelineRecord:
                 except ET.ParseError:
                     pass
 
-    # ── Step 3: last run date ────────────────────────────────────────────────
-    rec.last_run_date = get_last_run_date(session, job_url)
+        # ── Step 3: last run date ────────────────────────────────────────────
+        rec.last_run_date = get_last_run_date(session, job_url)
+
+    except Exception as exc:
+        # Catch-all: record the error but never let a single job crash the batch
+        logger.error("process_job crashed for %s: %s", job_url, exc, exc_info=True)
+        rec.error = f"process_job exception: {exc}"
+
+    finally:
+        session.close()   # always release socket, even on exception
 
     return rec
 
@@ -652,12 +707,14 @@ def process_jobs_in_batches(job_entries: list[tuple[str, str]]) -> list[Pipeline
     results: list[PipelineRecord] = []
     total = len(job_entries)
     processed = 0
+    log_every = max(1, min(500, total // 20))  # log ~20 times regardless of total size
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = job_entries[batch_start: batch_start + BATCH_SIZE]
         batch_num = batch_start // BATCH_SIZE + 1
-        logger.info("Processing batch %d (%d – %d of %d) …",
-                    batch_num, batch_start + 1, batch_start + len(batch), total)
+        logger.info("Processing batch %d/%d (%d – %d of %d) …",
+                    batch_num, -(-total // BATCH_SIZE),
+                    batch_start + 1, batch_start + len(batch), total)
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS,
                                 thread_name_prefix="jenkins-worker") as executor:
@@ -670,11 +727,13 @@ def process_jobs_in_batches(job_entries: list[tuple[str, str]]) -> list[Pipeline
                 try:
                     rec = future.result()
                 except Exception as exc:
+                    # process_job has its own catch-all, so this is a last resort
                     logger.error("Unhandled error for %s: %s", url, exc)
-                    rec = PipelineRecord(pipeline_url=url, folder_path=folder, error=str(exc))
+                    rec = PipelineRecord(pipeline_url=url, folder_path=folder,
+                                        error=f"unhandled: {exc}")
                 results.append(rec)
                 processed += 1
-                if processed % 1000 == 0:
+                if processed % log_every == 0 or processed == total:
                     logger.info("Progress: %d / %d jobs processed (%.1f%%)",
                                 processed, total, 100 * processed / total)
 
@@ -685,13 +744,30 @@ def process_jobs_in_batches(job_entries: list[tuple[str, str]]) -> list[Pipeline
 # CSV writer
 # ---------------------------------------------------------------------------
 def write_csv(records: list[PipelineRecord], path: str) -> None:
+    """Write records to CSV. Falls back to a temp file if the target path fails."""
     logger.info("Writing %d records to %s …", len(records), path)
+    try:
+        _write_csv_to(records, path)
+        logger.info("CSV written: %s", path)
+    except OSError as exc:
+        fallback = "jenkins_inventory_fallback.csv"
+        logger.error(
+            "Failed to write CSV to '%s': %s — trying fallback path '%s'",
+            path, exc, fallback,
+        )
+        try:
+            _write_csv_to(records, fallback)
+            logger.info("CSV written to fallback: %s", fallback)
+        except OSError as exc2:
+            logger.error("Fallback CSV write also failed: %s — data lost!", exc2)
+
+
+def _write_csv_to(records: list[PipelineRecord], path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(CSV_HEADERS)
         for rec in records:
             writer.writerow(astuple(rec))
-    logger.info("CSV written: %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -729,11 +805,12 @@ def _check_connectivity(session: requests.Session) -> None:
     logger.info("Connectivity check → %s  (connect=%ds  read=%ds)",
                 probe_url, probe_timeout[0], probe_timeout[1])
 
-    # Bare session — no Retry adapter so any error surfaces immediately.
+    # Bare session — no Retry adapter, no JSON Accept header (we're hitting /login HTML)
     probe_session = requests.Session()
     probe_session.auth = session.auth
     probe_session.verify = session.verify
-    probe_session.headers.update(session.headers)
+    # Deliberately do NOT copy session.headers — Accept: application/json
+    # causes some Jenkins instances to reject the /login page request.
 
     try:
         resp = probe_session.get(probe_url, timeout=probe_timeout, allow_redirects=True)
