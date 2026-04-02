@@ -14,6 +14,7 @@ import re
 import csv
 import time
 import logging
+import threading
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, fields, astuple
@@ -48,11 +49,14 @@ CONNECT_TIMEOUT      = int(os.environ.get("CONNECT_TIMEOUT", "15"))    # TCP con
 READ_TIMEOUT         = int(os.environ.get("READ_TIMEOUT", "90"))       # response read timeout (s)
 RETRY_COUNT          = int(os.environ.get("RETRY_COUNT", "3"))
 BACKOFF_FACTOR       = float(os.environ.get("BACKOFF_FACTOR", "2.0"))
-RATE_LIMIT_DELAY     = float(os.environ.get("RATE_LIMIT_DELAY", "0.05"))  # seconds between requests per thread
+RATE_LIMIT_DELAY     = float(os.environ.get("RATE_LIMIT_DELAY", "0.1"))   # seconds between requests per thread
 VERIFY_SSL           = os.environ.get("VERIFY_SSL", "true").lower() != "false"  # set VERIFY_SSL=false for self-signed certs
 
-# Convenience tuple used in every request call
-REQUEST_TIMEOUT      = (CONNECT_TIMEOUT, READ_TIMEOUT)
+# NOTE: REQUEST_TIMEOUT is intentionally a function so it always picks up
+# the current values of CONNECT_TIMEOUT / READ_TIMEOUT even after main()
+# sanitises / overrides them. A module-level tuple would be frozen at import.
+def get_timeout() -> tuple[int, int]:
+    return (CONNECT_TIMEOUT, READ_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -73,6 +77,14 @@ class PipelineRecord:
     error:              str = ""
 
 CSV_HEADERS = [f.name for f in fields(PipelineRecord)]
+
+# ---------------------------------------------------------------------------
+# Global concurrency semaphore — limits simultaneous in-flight requests
+# regardless of thread count, protecting Jenkins from overload.
+# Initialised in main() once MAX_WORKERS is known.
+# ---------------------------------------------------------------------------
+_SEMAPHORE: threading.Semaphore = threading.Semaphore(20)  # default; overridden in main()
+
 
 # ---------------------------------------------------------------------------
 # HTTP Session factory (per-thread sessions for thread-safety)
@@ -104,27 +116,29 @@ def make_session() -> requests.Session:
 # ---------------------------------------------------------------------------
 def get_json(session: requests.Session, url: str) -> Optional[dict]:
     """GET a Jenkins JSON API endpoint, return parsed dict or None."""
-    try:
+    with _SEMAPHORE:
         time.sleep(RATE_LIMIT_DELAY)
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            return resp.json()
-        logger.warning("GET %s -> HTTP %s", url, resp.status_code)
-    except Exception as exc:
-        logger.warning("GET %s failed: %s", url, exc)
+        try:
+            resp = session.get(url, timeout=get_timeout())
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("GET %s -> HTTP %s", url, resp.status_code)
+        except Exception as exc:
+            logger.warning("GET %s failed: %s", url, exc)
     return None
 
 
 def get_text(session: requests.Session, url: str) -> Optional[str]:
     """GET a plain-text or XML endpoint, return text or None."""
-    try:
+    with _SEMAPHORE:
         time.sleep(RATE_LIMIT_DELAY)
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200:
-            return resp.text
-        logger.warning("GET %s -> HTTP %s", url, resp.status_code)
-    except Exception as exc:
-        logger.warning("GET %s failed: %s", url, exc)
+        try:
+            resp = session.get(url, timeout=get_timeout())
+            if resp.status_code == 200:
+                return resp.text
+            logger.warning("GET %s -> HTTP %s", url, resp.status_code)
+        except Exception as exc:
+            logger.warning("GET %s failed: %s", url, exc)
     return None
 
 
@@ -567,7 +581,7 @@ def _check_connectivity(session: requests.Session) -> None:
     logger.info("Connectivity check → %s  (connect=%ds  read=%ds)",
                 probe_url, CONNECT_TIMEOUT, READ_TIMEOUT)
     try:
-        resp = session.get(probe_url, timeout=REQUEST_TIMEOUT)
+        resp = session.get(probe_url, timeout=get_timeout())
         if resp.status_code == 401:
             logger.error(
                 "Authentication failed (HTTP 401). "
@@ -631,8 +645,8 @@ def _check_connectivity(session: requests.Session) -> None:
 
 
 def main() -> None:
-    # Must declare global before any read or write of JENKINS_URL in this scope
-    global JENKINS_URL
+    # Must declare globals before any read or write in this scope
+    global JENKINS_URL, CONNECT_TIMEOUT, READ_TIMEOUT, _SEMAPHORE
 
     logger.info("Jenkins Inventory starting …")
     logger.info("Target Jenkins:  %s", JENKINS_URL)
@@ -650,6 +664,12 @@ def main() -> None:
     if sanitised != JENKINS_URL:
         logger.warning("JENKINS_URL trimmed from '%s' to '%s'", JENKINS_URL, sanitised)
         JENKINS_URL = sanitised
+
+    # Initialise the global semaphore with the configured worker count.
+    # This is the single choke-point that prevents Jenkins overload —
+    # no more than MAX_WORKERS requests can be in-flight at any moment.
+    _SEMAPHORE = threading.Semaphore(MAX_WORKERS)
+    logger.info("Concurrency semaphore set to %d slots", MAX_WORKERS)
 
     session = make_session()
 
