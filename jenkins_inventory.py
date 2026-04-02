@@ -48,14 +48,12 @@ BATCH_SIZE           = int(os.environ.get("BATCH_SIZE", "500"))        # jobs pe
 CONNECT_TIMEOUT      = int(os.environ.get("CONNECT_TIMEOUT", "15"))    # TCP connect timeout (s)
 READ_TIMEOUT         = int(os.environ.get("READ_TIMEOUT", "90"))       # response read timeout (s)
 RETRY_COUNT          = int(os.environ.get("RETRY_COUNT", "3"))
-BACKOFF_FACTOR       = float(os.environ.get("BACKOFF_FACTOR", "2.0"))
+BACKOFF_FACTOR       = float(os.environ.get("BACKOFF_FACTOR", "3.0"))
 RATE_LIMIT_DELAY     = float(os.environ.get("RATE_LIMIT_DELAY", "0.1"))   # seconds between requests per thread
-VERIFY_SSL           = os.environ.get("VERIFY_SSL", "true").lower() != "false"  # set VERIFY_SSL=false for self-signed certs
+VERIFY_SSL           = os.environ.get("VERIFY_SSL", "true").lower() != "false"
 
-# NOTE: REQUEST_TIMEOUT is intentionally a function so it always picks up
-# the current values of CONNECT_TIMEOUT / READ_TIMEOUT even after main()
-# sanitises / overrides them. A module-level tuple would be frozen at import.
 def get_timeout() -> tuple[int, int]:
+    """Always returns the live (CONNECT_TIMEOUT, READ_TIMEOUT) values."""
     return (CONNECT_TIMEOUT, READ_TIMEOUT)
 
 # ---------------------------------------------------------------------------
@@ -90,12 +88,26 @@ _SEMAPHORE: threading.Semaphore = threading.Semaphore(20)  # default; overridden
 # HTTP Session factory (per-thread sessions for thread-safety)
 # ---------------------------------------------------------------------------
 def make_session() -> requests.Session:
+    """
+    Build a requests Session.
+
+    IMPORTANT: We do NOT put read-timeout retries into urllib3's Retry object.
+    urllib3's Retry uses its own internal socket timeout (not our READ_TIMEOUT)
+    when it reconnects after a ReadTimeoutError, which caused the persistent
+    'read timeout=15' bug.  Instead, we retry manually in get_json/get_text
+    so that every attempt uses the current get_timeout() values.
+
+    We keep Retry only for HTTP status codes (429/5xx) and connection-level
+    errors, which are safe to delegate.
+    """
     session = requests.Session()
     retry = Retry(
         total=RETRY_COUNT,
         backoff_factor=BACKOFF_FACTOR,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
+        # Disable automatic read-timeout retries — we handle them manually
+        read=False,
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -112,33 +124,65 @@ def make_session() -> requests.Session:
 
 
 # ---------------------------------------------------------------------------
-# Jenkins API helpers
+# Jenkins API helpers  (manual retry so every attempt uses get_timeout())
 # ---------------------------------------------------------------------------
+def _request_with_retry(session: requests.Session, url: str) -> Optional[requests.Response]:
+    """
+    GET `url` with up to RETRY_COUNT attempts, honouring get_timeout() on
+    every attempt (not just the first one).  Sleeps RATE_LIMIT_DELAY before
+    each attempt and uses exponential back-off on transient failures.
+    The global _SEMAPHORE gates in-flight concurrency.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, RETRY_COUNT + 2):          # +2 → initial + RETRY_COUNT retries
+        wait = RATE_LIMIT_DELAY + (BACKOFF_FACTOR ** (attempt - 1) - 1) * 0.5
+        with _SEMAPHORE:
+            time.sleep(max(RATE_LIMIT_DELAY, wait if attempt > 1 else RATE_LIMIT_DELAY))
+            try:
+                resp = session.get(url, timeout=get_timeout())
+                return resp
+            except (requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as exc:
+                last_exc = exc
+                logger.warning(
+                    "Attempt %d/%d failed for %s — %s. Retrying in %.1fs …",
+                    attempt, RETRY_COUNT + 1, url, exc,
+                    BACKOFF_FACTOR ** attempt,
+                )
+            except Exception as exc:
+                logger.warning("GET %s failed: %s", url, exc)
+                return None
+        # Back-off sleep outside the semaphore so other threads can run
+        if attempt <= RETRY_COUNT:
+            time.sleep(BACKOFF_FACTOR ** attempt)
+
+    logger.warning("GET %s — all %d attempts failed: %s", url, RETRY_COUNT + 1, last_exc)
+    return None
+
+
 def get_json(session: requests.Session, url: str) -> Optional[dict]:
     """GET a Jenkins JSON API endpoint, return parsed dict or None."""
-    with _SEMAPHORE:
-        time.sleep(RATE_LIMIT_DELAY)
+    resp = _request_with_retry(session, url)
+    if resp is None:
+        return None
+    if resp.status_code == 200:
         try:
-            resp = session.get(url, timeout=get_timeout())
-            if resp.status_code == 200:
-                return resp.json()
-            logger.warning("GET %s -> HTTP %s", url, resp.status_code)
+            return resp.json()
         except Exception as exc:
-            logger.warning("GET %s failed: %s", url, exc)
+            logger.warning("JSON decode error for %s: %s", url, exc)
+            return None
+    logger.warning("GET %s -> HTTP %s", url, resp.status_code)
     return None
 
 
 def get_text(session: requests.Session, url: str) -> Optional[str]:
     """GET a plain-text or XML endpoint, return text or None."""
-    with _SEMAPHORE:
-        time.sleep(RATE_LIMIT_DELAY)
-        try:
-            resp = session.get(url, timeout=get_timeout())
-            if resp.status_code == 200:
-                return resp.text
-            logger.warning("GET %s -> HTTP %s", url, resp.status_code)
-        except Exception as exc:
-            logger.warning("GET %s failed: %s", url, exc)
+    resp = _request_with_retry(session, url)
+    if resp is None:
+        return None
+    if resp.status_code == 200:
+        return resp.text
+    logger.warning("GET %s -> HTTP %s", url, resp.status_code)
     return None
 
 
@@ -562,58 +606,50 @@ def write_csv(records: list[PipelineRecord], path: str) -> None:
 # ---------------------------------------------------------------------------
 def _check_connectivity(session: requests.Session) -> None:
     """
-    Fast connectivity pre-check before starting the full crawl.
-    Probes the Jenkins ROOT url only — never a job sub-path.
-    Exits with a clear error message if Jenkins is unreachable.
+    Probe the Jenkins root API to verify connectivity before crawling.
+    Uses get_timeout() directly — bypasses urllib3 Retry so the read
+    timeout is always the correct READ_TIMEOUT value.
     """
-    # Strip any accidental trailing /job/... from JENKINS_URL
     root_url = re.sub(r"(/job/[^/]+)+/?$", "", JENKINS_URL).rstrip("/")
     if root_url != JENKINS_URL:
         logger.warning(
-            "JENKINS_URL appears to contain a job path: %s\n"
-            "  → Stripping to root: %s\n"
-            "  → Please set JENKINS_URL to the Jenkins root, e.g. https://jenkins.cvshealth.com",
-            JENKINS_URL, root_url,
+            "JENKINS_URL contains a job path — stripped to root: %s", root_url
         )
 
-    # Use the lightest possible endpoint — just check we can authenticate
     probe_url = f"{root_url}/api/json?tree=nodeName"
     logger.info("Connectivity check → %s  (connect=%ds  read=%ds)",
                 probe_url, CONNECT_TIMEOUT, READ_TIMEOUT)
+
+    # Use a plain session.get with NO Retry adapter for the probe,
+    # so we get a clean error immediately without urllib3 retrying on its own.
+    probe_session = requests.Session()
+    probe_session.auth = session.auth
+    probe_session.verify = session.verify
+    probe_session.headers.update(session.headers)
+
     try:
-        resp = session.get(probe_url, timeout=get_timeout())
+        resp = probe_session.get(probe_url, timeout=get_timeout())
         if resp.status_code == 401:
-            logger.error(
-                "Authentication failed (HTTP 401). "
-                "Verify JENKINS_USER and JENKINS_TOKEN secrets are correct."
-            )
+            logger.error("HTTP 401 — check JENKINS_USER and JENKINS_TOKEN.")
             raise SystemExit(1)
         if resp.status_code == 403:
-            logger.error(
-                "Authorization failed (HTTP 403). "
-                "The service account lacks Overall/Read permission on Jenkins."
-            )
+            logger.error("HTTP 403 — service account lacks Overall/Read permission.")
             raise SystemExit(1)
         if resp.status_code not in (200, 404):
             logger.error("Unexpected HTTP %s from Jenkins probe.", resp.status_code)
             raise SystemExit(1)
         logger.info("Jenkins is reachable ✓  (HTTP %s)", resp.status_code)
+
     except requests.exceptions.ReadTimeout:
         logger.error(
             "\n"
             "═══════════════════════════════════════════════════════════\n"
-            " READ TIMEOUT — Jenkins responded to the TCP connection but\n"
-            " did not return a response within %ds.\n"
-            "═══════════════════════════════════════════════════════════\n"
-            " Likely causes:\n"
-            "   1. Jenkins is under heavy load — try again later.\n"
-            "   2. READ_TIMEOUT is too low — increase it (current: %ds).\n"
-            "      Set the secret/env var READ_TIMEOUT=120 or higher.\n"
-            "   3. A proxy or WAF is swallowing the request silently.\n"
-            "   4. JENKINS_URL contains a job path instead of the root.\n"
-            "      It must be: https://jenkins.cvshealth.com  (no /job/...)\n"
+            " READ TIMEOUT on connectivity probe (read=%ds).\n"
+            " Jenkins is reachable but not responding in time.\n"
+            " → Increase READ_TIMEOUT env var (e.g. READ_TIMEOUT=180)\n"
+            " → Or Jenkins is under heavy load — try again later.\n"
             "═══════════════════════════════════════════════════════════",
-            READ_TIMEOUT, READ_TIMEOUT,
+            READ_TIMEOUT,
         )
         raise SystemExit(1)
     except requests.exceptions.ConnectTimeout:
@@ -621,27 +657,20 @@ def _check_connectivity(session: requests.Session) -> None:
             "\n"
             "═══════════════════════════════════════════════════════════\n"
             " CONNECT TIMEOUT — cannot reach %s\n"
-            "═══════════════════════════════════════════════════════════\n"
-            " Likely causes:\n"
-            "   1. Jenkins is on a private/corporate network — use a\n"
-            "      self-hosted runner that has network access.\n"
-            "   2. Firewall is blocking the runner IP.\n"
-            "   3. Wrong JENKINS_URL or port number.\n"
-            "   4. Self-signed certificate — set VERIFY_SSL=false.\n"
+            " → Use a self-hosted runner with network access to Jenkins.\n"
+            " → Check JENKINS_URL, firewall rules, and port number.\n"
             "═══════════════════════════════════════════════════════════",
             root_url,
         )
         raise SystemExit(1)
     except requests.exceptions.SSLError as exc:
-        logger.error(
-            "SSL certificate error: %s\n"
-            "If Jenkins uses a self-signed cert, set the secret VERIFY_SSL=false",
-            exc,
-        )
+        logger.error("SSL error: %s  →  Set VERIFY_SSL=false if self-signed.", exc)
         raise SystemExit(1)
     except requests.exceptions.ConnectionError as exc:
         logger.error("Connection error during probe: %s", exc)
         raise SystemExit(1)
+    finally:
+        probe_session.close()
 
 
 def main() -> None:
