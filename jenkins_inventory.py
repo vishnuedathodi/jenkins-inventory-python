@@ -631,6 +631,9 @@ def _check_connectivity(session: requests.Session) -> None:
 
 
 def main() -> None:
+    # Must declare global before any read or write of JENKINS_URL in this scope
+    global JENKINS_URL
+
     logger.info("Jenkins Inventory starting …")
     logger.info("Target Jenkins:  %s", JENKINS_URL)
     logger.info("Workers: %d  |  Batch size: %d", MAX_WORKERS, BATCH_SIZE)
@@ -643,7 +646,6 @@ def main() -> None:
 
     # Sanitise: strip any accidental /job/... suffix from JENKINS_URL so that
     # BFS and the connectivity probe always start from the true Jenkins root.
-    global JENKINS_URL
     sanitised = re.sub(r"(/job/[^/]+)+/?$", "", JENKINS_URL).rstrip("/")
     if sanitised != JENKINS_URL:
         logger.warning("JENKINS_URL trimmed from '%s' to '%s'", JENKINS_URL, sanitised)
