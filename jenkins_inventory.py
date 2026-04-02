@@ -44,8 +44,8 @@ JENKINS_TOKEN        = os.environ.get("JENKINS_TOKEN", "")
 OUTPUT_CSV           = os.environ.get("OUTPUT_CSV", "jenkins_pipeline_inventory.csv")
 MAX_WORKERS          = int(os.environ.get("MAX_WORKERS", "20"))        # concurrent threads
 BATCH_SIZE           = int(os.environ.get("BATCH_SIZE", "500"))        # jobs per batch
-CONNECT_TIMEOUT      = int(os.environ.get("CONNECT_TIMEOUT", "10"))    # TCP connect timeout (s)
-READ_TIMEOUT         = int(os.environ.get("READ_TIMEOUT", "60"))       # response read timeout (s)
+CONNECT_TIMEOUT      = int(os.environ.get("CONNECT_TIMEOUT", "15"))    # TCP connect timeout (s)
+READ_TIMEOUT         = int(os.environ.get("READ_TIMEOUT", "90"))       # response read timeout (s)
 RETRY_COUNT          = int(os.environ.get("RETRY_COUNT", "3"))
 BACKOFF_FACTOR       = float(os.environ.get("BACKOFF_FACTOR", "2.0"))
 RATE_LIMIT_DELAY     = float(os.environ.get("RATE_LIMIT_DELAY", "0.05"))  # seconds between requests per thread
@@ -549,11 +549,23 @@ def write_csv(records: list[PipelineRecord], path: str) -> None:
 def _check_connectivity(session: requests.Session) -> None:
     """
     Fast connectivity pre-check before starting the full crawl.
-    Exits with a clear error message if Jenkins is unreachable,
-    rather than retrying 100k times and timing out.
+    Probes the Jenkins ROOT url only — never a job sub-path.
+    Exits with a clear error message if Jenkins is unreachable.
     """
-    probe_url = f"{JENKINS_URL}/api/json?tree=nodeName"
-    logger.info("Connectivity check → %s (connect timeout: %ds)", probe_url, CONNECT_TIMEOUT)
+    # Strip any accidental trailing /job/... from JENKINS_URL
+    root_url = re.sub(r"(/job/[^/]+)+/?$", "", JENKINS_URL).rstrip("/")
+    if root_url != JENKINS_URL:
+        logger.warning(
+            "JENKINS_URL appears to contain a job path: %s\n"
+            "  → Stripping to root: %s\n"
+            "  → Please set JENKINS_URL to the Jenkins root, e.g. https://jenkins.cvshealth.com",
+            JENKINS_URL, root_url,
+        )
+
+    # Use the lightest possible endpoint — just check we can authenticate
+    probe_url = f"{root_url}/api/json?tree=nodeName"
+    logger.info("Connectivity check → %s  (connect=%ds  read=%ds)",
+                probe_url, CONNECT_TIMEOUT, READ_TIMEOUT)
     try:
         resp = session.get(probe_url, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401:
@@ -565,32 +577,45 @@ def _check_connectivity(session: requests.Session) -> None:
         if resp.status_code == 403:
             logger.error(
                 "Authorization failed (HTTP 403). "
-                "The user lacks read permission on Jenkins."
+                "The service account lacks Overall/Read permission on Jenkins."
             )
             raise SystemExit(1)
         if resp.status_code not in (200, 404):
-            logger.error("Unexpected HTTP %s from Jenkins.", resp.status_code)
+            logger.error("Unexpected HTTP %s from Jenkins probe.", resp.status_code)
             raise SystemExit(1)
-        logger.info("Jenkins is reachable ✓")
+        logger.info("Jenkins is reachable ✓  (HTTP %s)", resp.status_code)
+    except requests.exceptions.ReadTimeout:
+        logger.error(
+            "\n"
+            "═══════════════════════════════════════════════════════════\n"
+            " READ TIMEOUT — Jenkins responded to the TCP connection but\n"
+            " did not return a response within %ds.\n"
+            "═══════════════════════════════════════════════════════════\n"
+            " Likely causes:\n"
+            "   1. Jenkins is under heavy load — try again later.\n"
+            "   2. READ_TIMEOUT is too low — increase it (current: %ds).\n"
+            "      Set the secret/env var READ_TIMEOUT=120 or higher.\n"
+            "   3. A proxy or WAF is swallowing the request silently.\n"
+            "   4. JENKINS_URL contains a job path instead of the root.\n"
+            "      It must be: https://jenkins.cvshealth.com  (no /job/...)\n"
+            "═══════════════════════════════════════════════════════════",
+            READ_TIMEOUT, READ_TIMEOUT,
+        )
+        raise SystemExit(1)
     except requests.exceptions.ConnectTimeout:
         logger.error(
             "\n"
             "═══════════════════════════════════════════════════════════\n"
-            " CONNECTION TIMEOUT — cannot reach %s\n"
+            " CONNECT TIMEOUT — cannot reach %s\n"
             "═══════════════════════════════════════════════════════════\n"
             " Likely causes:\n"
-            "   1. Jenkins is on a private/corporate network.\n"
-            "      → Use a self-hosted GitHub Actions runner that has\n"
-            "        network access to Jenkins (recommended).\n"
-            "   2. A firewall is blocking the runner's IP.\n"
-            "      → Whitelist GitHub Actions IP ranges, or use a VPN\n"
-            "        step (e.g. Tailscale) in the workflow.\n"
-            "   3. Wrong JENKINS_URL — check the secret value.\n"
-            "   4. Jenkins port is not 443 — include the port in the URL,\n"
-            "      e.g. https://jenkins.example.com:8443\n"
-            "   5. Self-signed certificate — set VERIFY_SSL=false secret.\n"
+            "   1. Jenkins is on a private/corporate network — use a\n"
+            "      self-hosted runner that has network access.\n"
+            "   2. Firewall is blocking the runner IP.\n"
+            "   3. Wrong JENKINS_URL or port number.\n"
+            "   4. Self-signed certificate — set VERIFY_SSL=false.\n"
             "═══════════════════════════════════════════════════════════",
-            JENKINS_URL,
+            root_url,
         )
         raise SystemExit(1)
     except requests.exceptions.SSLError as exc:
@@ -601,7 +626,7 @@ def _check_connectivity(session: requests.Session) -> None:
         )
         raise SystemExit(1)
     except requests.exceptions.ConnectionError as exc:
-        logger.error("Connection error: %s", exc)
+        logger.error("Connection error during probe: %s", exc)
         raise SystemExit(1)
 
 
@@ -615,6 +640,14 @@ def main() -> None:
     if not JENKINS_URL or JENKINS_URL == "https://jenkins.example.com":
         logger.error("JENKINS_URL is not set. Export the environment variable and retry.")
         raise SystemExit(1)
+
+    # Sanitise: strip any accidental /job/... suffix from JENKINS_URL so that
+    # BFS and the connectivity probe always start from the true Jenkins root.
+    global JENKINS_URL
+    sanitised = re.sub(r"(/job/[^/]+)+/?$", "", JENKINS_URL).rstrip("/")
+    if sanitised != JENKINS_URL:
+        logger.warning("JENKINS_URL trimmed from '%s' to '%s'", JENKINS_URL, sanitised)
+        JENKINS_URL = sanitised
 
     session = make_session()
 
