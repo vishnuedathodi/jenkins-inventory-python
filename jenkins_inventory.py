@@ -212,6 +212,63 @@ def _derive_folder_path(job_url: str) -> str:
 
 # Each queue entry is a tuple: (url, folder_label)
 # folder_label tracks the human-readable path of the *parent* container.
+def _fetch_jobs_at(session: requests.Session, base: str) -> list[dict]:
+    """
+    Fetch the immediate children of a Jenkins folder/view URL.
+    Tries ?tree=jobs[...] first; falls back to ?depth=1 if that returns
+    an empty jobs list (some Jenkins configs need depth=1 at the root).
+    Returns a list of raw job dicts (may be empty on failure).
+    """
+    # Primary: structured tree query
+    api_url = f"{base}/api/json?tree=jobs[name,url,_class]"
+    resp = _request_with_retry(session, api_url)
+    if resp is None:
+        logger.error(
+            "BFS: _request_with_retry returned None for %s — "
+            "all retry attempts failed (timeout or connection error).", api_url
+        )
+        return []
+
+    if resp.status_code != 200:
+        logger.error(
+            "BFS: HTTP %s for %s — check credentials/permissions.", resp.status_code, api_url
+        )
+        return []
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        logger.error("BFS: JSON decode error for %s: %s", api_url, exc)
+        return []
+
+    jobs = data.get("jobs", [])
+
+    # Fallback: if jobs list is empty at root level, maybe the instance
+    # requires depth=1 (e.g. CloudBees Jenkins Operations Center / parent pom).
+    if not jobs and base == JENKINS_URL:
+        logger.warning(
+            "BFS: root returned 0 jobs with tree= query — retrying with depth=1 …"
+        )
+        fallback_url = f"{base}/api/json?depth=1"
+        resp2 = _request_with_retry(session, fallback_url)
+        if resp2 and resp2.status_code == 200:
+            try:
+                data2 = resp2.json()
+                jobs = data2.get("jobs", [])
+                logger.info("BFS: depth=1 fallback returned %d jobs.", len(jobs))
+                # depth=1 jobs may not include _class — that's OK, we handle missing below
+            except Exception as exc:
+                logger.warning("BFS: depth=1 JSON decode error: %s", exc)
+        else:
+            logger.warning(
+                "BFS: depth=1 fallback also failed (status=%s).",
+                resp2.status_code if resp2 else "no response",
+            )
+
+    logger.debug("BFS: %s → %d immediate children", base, len(jobs))
+    return jobs
+
+
 def collect_all_jobs(session: requests.Session) -> list[tuple[str, str]]:
     """
     Recursively walk the Jenkins job tree and return a flat list of
@@ -221,7 +278,7 @@ def collect_all_jobs(session: requests.Session) -> list[tuple[str, str]]:
     folders beyond the requested depth (which caused the "only 4 entries" bug).
     Instead we fetch one level at a time and BFS-recurse explicitly.
     """
-    logger.info("Collecting all jobs from Jenkins …")
+    logger.info("Collecting all jobs from Jenkins (root: %s) …", JENKINS_URL)
     all_jobs: list[tuple[str, str]] = []
     # Queue items: (base_url, folder_label_so_far)
     queue: list[tuple[str, str]] = [(JENKINS_URL, "")]
@@ -233,14 +290,19 @@ def collect_all_jobs(session: requests.Session) -> list[tuple[str, str]]:
             continue
         visited.add(base)
 
-        # Fetch ONLY one level — no nested tree= so nothing gets silently truncated
-        api_url = f"{base}/api/json?tree=jobs[name,url,_class]"
-        data = get_json(session, api_url)
-        if not data:
-            logger.warning("No data returned for %s — skipping", base)
+        jobs = _fetch_jobs_at(session, base)
+        if not jobs:
+            if base == JENKINS_URL:
+                logger.error(
+                    "BFS: No jobs returned at root level (%s).\n"
+                    "  → Verify JENKINS_URL is the Jenkins root (no /job/... suffix).\n"
+                    "  → Confirm the service account has Overall/Read + Job/Read.\n"
+                    "  → Check the log above for HTTP status or timeout details.",
+                    JENKINS_URL,
+                )
             continue
 
-        for job in data.get("jobs", []):
+        for job in jobs:
             job_url   = job.get("url", "").rstrip("/")
             job_name  = job.get("name", "")
             job_class = job.get("_class", "")
@@ -266,7 +328,10 @@ def collect_all_jobs(session: requests.Session) -> list[tuple[str, str]]:
                 folder = parent_folder if parent_folder else "(root)"
                 all_jobs.append((job_url, folder))
 
-        logger.debug("BFS queue size: %d  |  collected so far: %d", len(queue), len(all_jobs))
+        # Log progress every 100 BFS nodes visited so large instances show signs of life
+        if len(visited) % 100 == 0:
+            logger.info("BFS progress: %d nodes visited, %d jobs found, %d in queue",
+                        len(visited), len(all_jobs), len(queue))
 
     logger.info("Total jobs found: %d", len(all_jobs))
     return all_jobs
