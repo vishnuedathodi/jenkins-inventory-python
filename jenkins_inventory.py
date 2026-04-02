@@ -20,8 +20,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, fields, astuple
 from typing import Optional
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,15 +44,20 @@ OUTPUT_CSV           = os.environ.get("OUTPUT_CSV", "jenkins_pipeline_inventory.
 MAX_WORKERS          = int(os.environ.get("MAX_WORKERS", "20"))        # concurrent threads
 BATCH_SIZE           = int(os.environ.get("BATCH_SIZE", "500"))        # jobs per batch
 CONNECT_TIMEOUT      = int(os.environ.get("CONNECT_TIMEOUT", "15"))    # TCP connect timeout (s)
-READ_TIMEOUT         = int(os.environ.get("READ_TIMEOUT", "90"))       # response read timeout (s)
+READ_TIMEOUT         = int(os.environ.get("READ_TIMEOUT", "180"))      # response read timeout (s)
 RETRY_COUNT          = int(os.environ.get("RETRY_COUNT", "3"))
-BACKOFF_FACTOR       = float(os.environ.get("BACKOFF_FACTOR", "3.0"))
-RATE_LIMIT_DELAY     = float(os.environ.get("RATE_LIMIT_DELAY", "0.1"))   # seconds between requests per thread
+BACKOFF_FACTOR       = float(os.environ.get("BACKOFF_FACTOR", "2.0"))
+RATE_LIMIT_DELAY     = float(os.environ.get("RATE_LIMIT_DELAY", "0.2"))   # seconds between requests per thread
 VERIFY_SSL           = os.environ.get("VERIFY_SSL", "true").lower() != "false"
 
 def get_timeout() -> tuple[int, int]:
     """Always returns the live (CONNECT_TIMEOUT, READ_TIMEOUT) values."""
     return (CONNECT_TIMEOUT, READ_TIMEOUT)
+
+
+def get_read_timeout() -> int:
+    """Return only the read timeout — used where connect already happened."""
+    return READ_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -89,30 +92,21 @@ _SEMAPHORE: threading.Semaphore = threading.Semaphore(20)  # default; overridden
 # ---------------------------------------------------------------------------
 def make_session() -> requests.Session:
     """
-    Build a requests Session.
+    Build a requests Session with NO custom HTTPAdapter.
 
-    IMPORTANT: We do NOT put read-timeout retries into urllib3's Retry object.
-    urllib3's Retry uses its own internal socket timeout (not our READ_TIMEOUT)
-    when it reconnects after a ReadTimeoutError, which caused the persistent
-    'read timeout=15' bug.  Instead, we retry manually in get_json/get_text
-    so that every attempt uses the current get_timeout() values.
+    We intentionally do NOT mount an HTTPAdapter with Retry here.
+    The HTTPAdapter stores the urllib3 connection pool, which caches its own
+    timeout value internally.  When urllib3 reconnects after a ReadTimeoutError
+    it re-uses the pooled (connect) timeout — that is why 'read timeout=15'
+    kept appearing even when READ_TIMEOUT=90.
 
-    We keep Retry only for HTTP status codes (429/5xx) and connection-level
-    errors, which are safe to delegate.
+    Without a custom adapter, requests uses its default adapter which passes
+    our explicit timeout=(connect, read) tuple straight through to urllib3
+    on every single request with no caching.  All retry logic lives in
+    _request_with_retry() so we don't need urllib3's Retry at all.
     """
     session = requests.Session()
-    retry = Retry(
-        total=RETRY_COUNT,
-        backoff_factor=BACKOFF_FACTOR,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        # Disable automatic read-timeout retries — we handle them manually
-        read=False,
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    # No HTTPAdapter mount — use requests' built-in default adapter
     if JENKINS_USER and JENKINS_TOKEN:
         session.auth = (JENKINS_USER, JENKINS_TOKEN)
     session.headers.update({"Accept": "application/json"})
@@ -128,35 +122,69 @@ def make_session() -> requests.Session:
 # ---------------------------------------------------------------------------
 def _request_with_retry(session: requests.Session, url: str) -> Optional[requests.Response]:
     """
-    GET `url` with up to RETRY_COUNT attempts, honouring get_timeout() on
-    every attempt (not just the first one).  Sleeps RATE_LIMIT_DELAY before
-    each attempt and uses exponential back-off on transient failures.
-    The global _SEMAPHORE gates in-flight concurrency.
+    GET `url` with up to RETRY_COUNT+1 attempts.
+
+    Design notes
+    ────────────
+    • timeout=(CONNECT_TIMEOUT, READ_TIMEOUT) is read fresh on every attempt
+      directly from the module globals — no caching, no HTTPAdapter pool.
+    • stream=True + response.content forces urllib3 to read the full body
+      inside our timeout window, not just wait for the first byte.
+    • Semaphore gates max simultaneous in-flight requests to protect Jenkins.
+    • Back-off sleep runs OUTSIDE the semaphore so other threads can proceed.
     """
     last_exc: Optional[Exception] = None
-    for attempt in range(1, RETRY_COUNT + 2):          # +2 → initial + RETRY_COUNT retries
-        wait = RATE_LIMIT_DELAY + (BACKOFF_FACTOR ** (attempt - 1) - 1) * 0.5
+    total_attempts = RETRY_COUNT + 1
+
+    for attempt in range(1, total_attempts + 1):
+        # Read globals fresh every attempt — these are the values that will
+        # actually reach urllib3.  Log them so any mismatch is obvious.
+        ct = CONNECT_TIMEOUT
+        rt = READ_TIMEOUT
+
         with _SEMAPHORE:
-            time.sleep(max(RATE_LIMIT_DELAY, wait if attempt > 1 else RATE_LIMIT_DELAY))
+            time.sleep(RATE_LIMIT_DELAY)
             try:
-                resp = session.get(url, timeout=get_timeout())
+                resp = session.get(url, timeout=(ct, rt), stream=True)
+                # Force full body download inside the timeout window.
+                # Without this, timeout only covers the first byte ("time to
+                # first byte"), and large JSON responses (root /api/json with
+                # 100k jobs) stall after the headers arrive.
+                _ = resp.content
                 return resp
-            except (requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError) as exc:
+            except requests.exceptions.ReadTimeout as exc:
                 last_exc = exc
+                backoff = BACKOFF_FACTOR ** attempt
                 logger.warning(
-                    "Attempt %d/%d failed for %s — %s. Retrying in %.1fs …",
-                    attempt, RETRY_COUNT + 1, url, exc,
-                    BACKOFF_FACTOR ** attempt,
+                    "Attempt %d/%d — ReadTimeout(connect=%ds, read=%ds) for %s. "
+                    "Retrying in %.1fs …",
+                    attempt, total_attempts, ct, rt, url, backoff,
+                )
+            except requests.exceptions.ConnectTimeout as exc:
+                last_exc = exc
+                backoff = BACKOFF_FACTOR ** attempt
+                logger.warning(
+                    "Attempt %d/%d — ConnectTimeout(connect=%ds) for %s. "
+                    "Retrying in %.1fs …",
+                    attempt, total_attempts, ct, url, backoff,
+                )
+            except requests.exceptions.ConnectionError as exc:
+                last_exc = exc
+                backoff = BACKOFF_FACTOR ** attempt
+                logger.warning(
+                    "Attempt %d/%d — ConnectionError for %s: %s. "
+                    "Retrying in %.1fs …",
+                    attempt, total_attempts, url, exc, backoff,
                 )
             except Exception as exc:
-                logger.warning("GET %s failed: %s", url, exc)
+                logger.warning("GET %s — unexpected error: %s", url, exc)
                 return None
-        # Back-off sleep outside the semaphore so other threads can run
-        if attempt <= RETRY_COUNT:
+
+        # Back-off outside the semaphore so other threads can proceed
+        if attempt < total_attempts:
             time.sleep(BACKOFF_FACTOR ** attempt)
 
-    logger.warning("GET %s — all %d attempts failed: %s", url, RETRY_COUNT + 1, last_exc)
+    logger.warning("GET %s — all %d attempts failed: %s", url, total_attempts, last_exc)
     return None
 
 
